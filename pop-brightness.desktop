@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Pop Brightness
+Comment=Adjust screen brightness
+Exec=/home/vic/.local/bin/pop-brightness
+Icon=display-brightness
+Terminal=false
+Type=Application
+Categories=Utility;Settings;
+Keywords=brightness;display;screen;

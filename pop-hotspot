@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, GLib, GObject
+import subprocess, os, json, fcntl, threading
+
+CONFIG_DIR = os.path.expanduser("~/.config/pop-hotspot")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+BLOCKED_FILE = os.path.join(CONFIG_DIR, "blocked.json")
+WIFI_IFACE = "wlo1"
+
+def load_json(path, default):
+    try:
+        with open(path) as f: return json.load(f)
+    except: return default
+
+def save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f: json.dump(data, f, indent=2)
+
+config = load_json(CONFIG_FILE, {"ssid": "PopOS-Hotspot", "password": "popos1234", "band": "bg"})
+blocked = load_json(BLOCKED_FILE, [])
+save_json(CONFIG_FILE, config)
+save_json(BLOCKED_FILE, blocked)
+
+CONN_NAME = "PopHotspot"
+
+def run_cmd(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except:
+        return None
+
+def is_hotspot_active():
+    r = run_cmd(["nmcli", "-t", "-f", "NAME,STATE", "connection", "show"])
+    if r and r.returncode == 0:
+        for line in r.stdout.splitlines():
+            parts = line.split(":")
+            if len(parts) >= 2 and parts[0] == CONN_NAME:
+                return parts[1] == "activated"
+    return False
+
+def conn_exists():
+    r = run_cmd(["nmcli", "-t", "-f", "NAME", "connection", "show"])
+    return r and CONN_NAME in r.stdout
+
+def get_clients():
+    r = run_cmd(["iw", "dev", WIFI_IFACE, "station", "dump"])
+    if not r or r.returncode != 0:
+        return {}
+    clients = {}
+    cur_mac = None
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            cur_mac = None; continue
+        if line.startswith("Station"):
+            cur_mac = line.split()[1]
+            clients[cur_mac] = {"mac": cur_mac, "signal": "", "rx": "", "tx": "", "ip": ""}
+        elif cur_mac:
+            parts = line.split()
+            if line.startswith("signal:"):
+                clients[cur_mac]["signal"] = parts[1] if len(parts) > 1 else ""
+            elif "rx bytes:" in line:
+                tok = line.split()
+                if len(tok) >= 1:
+                    clients[cur_mac]["rx"] = tok[-1]
+            elif "tx bytes:" in line:
+                tok = line.split()
+                if len(tok) >= 1:
+                    clients[cur_mac]["tx"] = tok[-1]
+    if clients:
+        arp_r = run_cmd(["ip", "neigh", "show", "dev", WIFI_IFACE])
+        if arp_r and arp_r.returncode == 0:
+            for line in arp_r.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and parts[1] == "lladdr":
+                    ip = parts[0]
+                    mac = parts[2]
+                    if mac in clients:
+                        clients[mac]["ip"] = ip
+        for mac in clients:
+            if not clients[mac].get("ip"):
+                clients[mac]["ip"] = "N/A"
+    return clients
+
+def apply_iptables_block():
+    run_cmd(["iptables", "-F", "POP_HOTSPOT_BLOCK"])
+    run_cmd(["iptables", "-X", "POP_HOTSPOT_BLOCK"])
+    run_cmd(["iptables", "-N", "POP_HOTSPOT_BLOCK"])
+    for mac in blocked:
+        run_cmd(["iptables", "-A", "POP_HOTSPOT_BLOCK",
+                 "-m", "mac", "--mac-source", mac, "-j", "DROP"])
+        run_cmd(["iptables", "-A", "POP_HOTSPOT_BLOCK",
+                 "-i", WIFI_IFACE, "-m", "mac", "--mac-source", mac, "-j", "DROP"])
+    run_cmd(["iptables", "-I", "FORWARD", "-j", "POP_HOTSPOT_BLOCK"])
+    run_cmd(["iptables", "-I", "INPUT", "-j", "POP_HOTSPOT_BLOCK"])
+
+def clear_iptables_block():
+    run_cmd(["iptables", "-D", "FORWARD", "-j", "POP_HOTSPOT_BLOCK"])
+    run_cmd(["iptables", "-D", "INPUT", "-j", "POP_HOTSPOT_BLOCK"])
+    run_cmd(["iptables", "-F", "POP_HOTSPOT_BLOCK"])
+    run_cmd(["iptables", "-X", "POP_HOTSPOT_BLOCK"])
+
+def deauth_client(mac):
+    run_cmd(["iw", "wlo1", "station", "set", mac, "action", "deauth"])
+
+def reset_wifi_iface():
+    run_cmd(["nmcli", "radio", "wifi", "off"])
+    run_cmd(["nmcli", "radio", "wifi", "on"])
+    import time; time.sleep(1)
+
+def ensure_iface_up():
+    r = run_cmd(["ip", "link", "show", WIFI_IFACE])
+    if r and "state UP" not in r.stdout:
+        run_cmd(["ip", "link", "set", WIFI_IFACE, "up"])
+        import time; time.sleep(1)
+    run_cmd(["rfkill", "unblock", "wlan"])
+
+def turn_on_hotspot():
+    ensure_iface_up()
+    if conn_exists():
+        run_cmd(["nmcli", "connection", "delete", CONN_NAME])
+    r = run_cmd([
+        "nmcli", "connection", "add",
+        "type", "wifi", "ifname", WIFI_IFACE,
+        "con-name", CONN_NAME, "autoconnect", "no",
+        "ssid", config["ssid"],
+    ])
+    if r and r.returncode == 0:
+        modify_cmd = [
+            "nmcli", "connection", "modify", CONN_NAME,
+            "802-11-wireless.mode", "ap",
+            "ipv4.method", "shared",
+            "wifi-sec.key-mgmt", "wpa-psk",
+            "wifi-sec.proto", "rsn",
+            "wifi-sec.pairwise", "ccmp",
+            "wifi-sec.group", "ccmp",
+            "wifi-sec.psk", config["password"],
+        ]
+        band = config.get("band", "auto")
+        if band != "auto":
+            modify_cmd.extend(["802-11-wireless.band", band])
+        run_cmd(modify_cmd)
+    up = run_cmd(["nmcli", "connection", "up", CONN_NAME])
+    if up and up.returncode != 0:
+        reset_wifi_iface()
+        up = run_cmd(["nmcli", "connection", "up", CONN_NAME])
+    apply_iptables_block()
+    return up and up.returncode == 0
+
+def turn_off_hotspot():
+    r = run_cmd(["nmcli", "connection", "down", CONN_NAME])
+    clear_iptables_block()
+    return r and r.returncode == 0
+
+class HotspotApp(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Pop Hotspot")
+        self.set_border_width(0)
+        self.set_default_size(480, 500)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.connect("destroy", Gtk.main_quit)
+        self.blocked_set = set(blocked)
+
+        header = Gtk.HeaderBar()
+        header.set_show_close_button(True)
+        header.set_title("Pop Hotspot")
+        self.set_titlebar(header)
+
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        self.add(self.stack)
+
+        stack_switcher = Gtk.StackSwitcher()
+        stack_switcher.set_stack(self.stack)
+        header.set_custom_title(stack_switcher)
+
+        self.build_main_page()
+        self.build_settings_page()
+        self.stack.set_visible_child_name("main")
+
+        self.block_confirm_mac = None
+        self.refresh()
+        GLib.timeout_add_seconds(5, self.refresh_clients)
+
+    def build_main_page(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.stack.add_titled(vbox, "main", "Hotspot")
+
+        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=16)
+        self.status_label = Gtk.Label()
+        self.status_label.set_markup("<b>Checking...</b>")
+        top.pack_start(self.status_label, False, False, 0)
+
+        self.switch = Gtk.Switch()
+        self.switch.set_halign(Gtk.Align.CENTER)
+        sb = Gtk.Box(spacing=8)
+        sb.pack_start(Gtk.Label(label="Off"), False, False, 0)
+        sb.pack_start(self.switch, False, False, 0)
+        sb.pack_start(Gtk.Label(label="On"), False, False, 0)
+        top.pack_start(sb, False, False, 0)
+        self.switch.connect("notify::active", self.on_switch)
+        vbox.pack_start(top, False, False, 0)
+
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        vbox.pack_start(sep, False, False, 0)
+
+        client_header = Gtk.Label(label="<b>Connected Clients</b>", use_markup=True, margin_top=8)
+        vbox.pack_start(client_header, False, False, 0)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.set_min_content_height(200)
+        vbox.pack_start(sw, True, True, 0)
+
+        store = Gtk.ListStore(str, str, str, str, str)
+        self.clients_store = store
+        render_ip = lambda v: "IP" if hasattr(self, '_setup') and self._setup else "IP"
+        self.clients_tree = Gtk.TreeView(model=store)
+        cols = [("MAC", 0, 120), ("IP", 1, 100), ("Signal", 2, 60), ("TX/RX", 3, 100)]
+        for title, idx, w in cols:
+            c = Gtk.TreeViewColumn(title, Gtk.CellRendererText(), text=idx)
+            c.set_resizable(True); c.set_min_width(w)
+            self.clients_tree.append_column(c)
+
+        renderer_toggle = Gtk.CellRendererToggle()
+        renderer_toggle.set_activatable(True)
+        renderer_toggle.connect("toggled", self.on_block_toggled, 4)
+        col_action = Gtk.TreeViewColumn("Blocked", renderer_toggle, active=4)
+        self.clients_tree.append_column(col_action)
+
+        sw.add(self.clients_tree)
+        self._setup = True
+
+    def build_settings_page(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=16)
+        self.stack.add_titled(vbox, "settings", "Settings")
+
+        settings_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        settings_box.set_margin_bottom(12)
+
+        row = Gtk.Box(spacing=8)
+        row.pack_start(Gtk.Label(label="SSID:", width_chars=10), False, False, 0)
+        self.ssid_entry = Gtk.Entry(text=config["ssid"])
+        row.pack_start(self.ssid_entry, True, True, 0)
+        settings_box.pack_start(row, False, False, 0)
+
+        row2 = Gtk.Box(spacing=8)
+        row2.pack_start(Gtk.Label(label="Password:", width_chars=10), False, False, 0)
+        self.pass_entry = Gtk.Entry(text=config["password"], visibility=False)
+        self.pass_entry.set_visibility(False)
+        row2.pack_start(self.pass_entry, True, True, 0)
+        settings_box.pack_start(row2, False, False, 0)
+
+        row_band = Gtk.Box(spacing=8)
+        row_band.pack_start(Gtk.Label(label="Band:", width_chars=10), False, False, 0)
+        self.band_combo = Gtk.ComboBoxText()
+        bands = [("auto", "Auto"), ("bg", "2.4 GHz"), ("a", "5 GHz")]
+        for val, label in bands:
+            self.band_combo.append(val, label)
+        current_band = config.get("band", "auto")
+        self.band_combo.set_active_id(current_band)
+        row_band.pack_start(self.band_combo, True, True, 0)
+        settings_box.pack_start(row_band, False, False, 0)
+
+        hb = Gtk.Box(spacing=8)
+        show_btn = Gtk.Button(label="Show")
+        show_btn.connect("clicked", lambda w: self.pass_entry.set_visibility(
+            not self.pass_entry.get_visibility()))
+        hb.pack_start(show_btn, False, False, 0)
+        save_btn = Gtk.Button(label="Save && Recreate")
+        save_btn.get_style_context().add_class("suggested-action")
+        save_btn.connect("clicked", self.save_settings)
+        hb.pack_end(save_btn, False, False, 0)
+        settings_box.pack_start(hb, False, False, 0)
+
+        vbox.pack_start(settings_box, False, False, 0)
+
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        vbox.pack_start(sep, False, False, 0)
+
+        blk_header = Gtk.Label(label="<b>Blocked Clients</b>", use_markup=True, margin_top=8)
+        vbox.pack_start(blk_header, False, False, 0)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.set_min_content_height(120)
+        vbox.pack_start(sw, True, True, 0)
+
+        bstore = Gtk.ListStore(str)
+        self.blocked_store = bstore
+        btree = Gtk.TreeView(model=bstore)
+        c = Gtk.TreeViewColumn("MAC Address", Gtk.CellRendererText(), text=0)
+        c.set_resizable(True); c.set_min_width(200)
+        btree.append_column(c)
+
+        renderer_unblock = Gtk.CellRendererToggle()
+        renderer_unblock.set_activatable(True)
+        renderer_unblock.connect("toggled", self.on_unblock_toggled)
+        col_unblock = Gtk.TreeViewColumn("Unblock", renderer_unblock)
+        btree.append_column(col_unblock)
+
+        sw.add(btree)
+        self.blocked_tree = btree
+        self.refresh_blocked()
+
+    def run_cmd(self, cmd):
+        return run_cmd(cmd)
+
+    def is_active(self):
+        return is_hotspot_active()
+
+    def conn_exists(self):
+        return conn_exists()
+
+    def refresh(self, polling=False):
+        active = self.is_active()
+        self.status_label.set_markup(
+            f"<b>{'🟢 Active' if active else '🔴 Inactive'}</b>"
+        )
+        self.switch.handler_block_by_func(self.on_switch)
+        self.switch.set_active(active)
+        self.switch.handler_unblock_by_func(self.on_switch)
+        if not polling:
+            self.switch.set_sensitive(True)
+        self.refresh_clients()
+        return False
+
+    def refresh_clients(self):
+        if not self.is_active():
+            self.clients_store.clear()
+            return True
+        clients = get_clients()
+        self.clients_store.clear()
+        for mac, info in clients.items():
+            is_blk = mac in self.blocked_set
+            self.clients_store.append([
+                mac,
+                info.get("ip", "") or "N/A",
+                info.get("signal", ""),
+                f"TX:{info.get('tx','?')} RX:{info.get('rx','?')}",
+                str(is_blk).lower(),
+            ])
+        return True
+
+    def refresh_blocked(self):
+        self.blocked_store.clear()
+        for mac in sorted(self.blocked_set):
+            self.blocked_store.append([mac])
+
+    def poll_operation(self, target_active, tries=0):
+        if tries > 30:
+            actual = self.is_active()
+            self.status_label.set_markup(
+                f"<b>⚠️ Timed out (try Settings → Save & Recreate)</b>"
+            )
+            self.switch.set_sensitive(True)
+            self.switch.handler_block_by_func(self.on_switch)
+            self.switch.set_active(actual)
+            self.switch.handler_unblock_by_func(self.on_switch)
+            return False
+        if self.is_active() == target_active:
+            self.refresh()
+            return False
+        self.status_label.set_markup(
+            f"<b>⏳ {'Starting' if target_active else 'Stopping'}...</b>"
+        )
+        GLib.timeout_add(800, self.poll_operation, target_active, tries + 1)
+        return False
+
+    def on_switch(self, switch, gparam):
+        if not switch.get_sensitive():
+            return
+        self.switch.set_sensitive(False)
+        target = switch.get_active()
+        self.status_label.set_markup(
+            f"<b>⏳ {'Starting' if target else 'Stopping'}...</b>"
+        )
+        def blocking():
+            if target:
+                turn_on_hotspot()
+            else:
+                turn_off_hotspot()
+            GLib.idle_add(self.poll_operation, target, 0)
+        threading.Thread(target=blocking, daemon=True).start()
+
+    def on_block_toggled(self, renderer, path, col):
+        mac = self.clients_store[path][0]
+        if mac in self.blocked_set:
+            self.blocked_set.discard(mac)
+            blocked[:] = list(self.blocked_set)
+            save_json(BLOCKED_FILE, blocked)
+            apply_iptables_block()
+        else:
+            self.block_confirm_mac = mac
+            dialog = Gtk.MessageDialog(
+                transient_for=self, modal=True,
+                message_type=Gtk.MessageType.WARNING,
+                buttons=Gtk.ButtonsType.YES_NO,
+                text=f"Block {mac}?",
+            )
+            dialog.format_secondary_text(
+                "This client will be disconnected and blocked from the hotspot."
+            )
+            resp = dialog.run()
+            dialog.destroy()
+            if resp == Gtk.ResponseType.YES:
+                self.blocked_set.add(mac)
+                blocked[:] = list(self.blocked_set)
+                save_json(BLOCKED_FILE, blocked)
+                deauth_client(mac)
+                apply_iptables_block()
+        self.refresh_clients()
+        self.refresh_blocked()
+
+    def on_unblock_toggled(self, renderer, path):
+        mac = self.blocked_store[path][0]
+        self.blocked_set.discard(mac)
+        blocked[:] = list(self.blocked_set)
+        save_json(BLOCKED_FILE, blocked)
+        apply_iptables_block()
+        self.refresh_blocked()
+        self.refresh_clients()
+
+    def save_settings(self, w):
+        new_ssid = self.ssid_entry.get_text().strip()
+        new_pass = self.pass_entry.get_text().strip()
+        if not new_ssid or not new_pass:
+            dialog = Gtk.MessageDialog(transient_for=self, modal=True,
+                message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.OK,
+                text="SSID and password cannot be empty.")
+            dialog.run(); dialog.destroy()
+            return
+        if len(new_pass) < 8:
+            dialog = Gtk.MessageDialog(transient_for=self, modal=True,
+                message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.OK,
+                text="Password must be at least 8 characters.")
+            dialog.run(); dialog.destroy()
+            return
+        was_active = self.is_active()
+        if was_active:
+            turn_off_hotspot()
+        config["ssid"] = new_ssid
+        config["password"] = new_pass
+        config["band"] = self.band_combo.get_active_id() or "auto"
+        save_json(CONFIG_FILE, config)
+        if was_active:
+            turn_on_hotspot()
+        dialog = Gtk.MessageDialog(transient_for=self, modal=True,
+            message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK,
+            text="Settings saved. Hotspot recreated.")
+        dialog.run(); dialog.destroy()
+        self.refresh()
+
+if __name__ == "__main__":
+    app = HotspotApp()
+    app.show_all()
+    Gtk.main()
