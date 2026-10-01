@@ -224,7 +224,11 @@ def tether_start():
                              stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         open(TETHER_PID_FILE, "w").write(str(p.pid))
         time.sleep(1.5)
-    run_cmd([GNIREHTET_BIN, "start", serial], timeout=30, cwd=GNIREHTET_DIR)
+    # 8.8.8.8 is Gnirehtet's default; add a second resolver in case it is blocked
+    dns = config.get("tether_dns") or "8.8.8.8,1.1.1.1"
+    r = run_cmd([GNIREHTET_BIN, "restart", serial, "-d", dns], timeout=45, cwd=GNIREHTET_DIR)
+    if not (r and r.returncode == 0):
+        run_cmd([GNIREHTET_BIN, "start", serial, "-d", dns], timeout=30, cwd=GNIREHTET_DIR)
     for _ in range(24):
         if tether_client_up():
             last_error = ""
@@ -379,7 +383,10 @@ class HotspotApp(Gtk.Window):
         tbox.pack_start(trow, False, False, 0)
         tbox.pack_start(Gtk.Label(xalign=0, use_markup=True,
             label="<small>Bluetooth stays on 2.4 GHz alone, so it stops slowing Wi-Fi down. "
-                  "Needs the USB cable + USB debugging.</small>"), False, False, 0)
+                  "Needs the USB cable + USB debugging.\n"
+                  "Some apps may still claim “no connection” — Android sees the tunnel as a "
+                  "separate network: restart the app, and leave Wi-Fi/mobile data on.</small>"),
+            False, False, 0)
         vbox.pack_start(tbox, False, False, 0)
 
         sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)

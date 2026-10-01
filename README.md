@@ -68,6 +68,16 @@ The laptop's Wi-Fi can stay off entirely and Bluetooth is free of Wi-Fi contenti
 Notes
 - The USB cable must stay connected. If you unplug it, the tether goes stale:
   flip the switch off and on again to re-establish.
+- DNS: the tunnel advertises `8.8.8.8` plus `1.1.1.1` as a fallback
+  (`gnirehtet ... -d 8.8.8.8,1.1.1.1`), so a blocked resolver does not take the
+  whole tunnel down. Override with the `tether_dns` key in `config.json`.
+- Some apps may still claim there is **no connection** while the tunnel works
+  perfectly (verified: a cache-busted `example.com` fetch left through the
+  laptop's network). Android treats the VPN as a separate network, so apps that
+  read the system network state, rather than actually testing traffic, can show
+  offline banners. Leaving Wi-Fi or mobile data switched on gives Android a
+  validated network to report (traffic still prefers the tunnel), and restarting
+  the complaining app clears its cached state.
 - Turning the switch off (or closing the window, unless you ticked
   *“Keep USB tether running after closing this window”*) stops the phone client
   **before** the relay — a live VPN with a dead relay would black-hole the phone's
@@ -125,3 +135,4 @@ Three real fixes, best first:
 | Hotspot times out | `nmcli connection up PopHotspot` in a terminal to read the real error; the profile is recreated on every toggle |
 | USB Tether won't start | Check the cable + USB debugging (`adb devices` must show `device`), then retry; the app installs the phone client automatically |
 | Phone shows VPN but no internet | Relay not running — toggle the switch off/on (see `~/.config/pop-hotspot/tether.log`) |
+| An app says “no connection” although the tether works | Android reports the tunnel as a *separate* network, so apps that read the network state (Chrome, Play Store banners) may disagree while traffic flows fine. Leave Wi-Fi/mobile data on so Android has a validated network to report, and restart the app that complains. Verify the tunnel from the log: connections from `10.0.0.2` to `:80`/`:443`. |
