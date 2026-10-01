@@ -2,12 +2,11 @@
 import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GLib, GObject
-import subprocess, os, json, fcntl, threading
+import subprocess, os, json, fcntl, threading, re, time
 
 CONFIG_DIR = os.path.expanduser("~/.config/pop-hotspot")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 BLOCKED_FILE = os.path.join(CONFIG_DIR, "blocked.json")
-WIFI_IFACE = "wlo1"
 
 def load_json(path, default):
     try:
@@ -25,11 +24,57 @@ save_json(BLOCKED_FILE, blocked)
 
 CONN_NAME = "PopHotspot"
 
-def run_cmd(cmd):
+def run_cmd(cmd, timeout=10, cwd=None):
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
     except:
         return None
+
+last_error = ""
+
+def detect_wifi_iface():
+    """First Wi-Fi interface NetworkManager knows about (works for USB dongles too)."""
+    r = run_cmd(["nmcli", "-t", "-f", "DEVICE,TYPE", "device", "status"])
+    if r and r.returncode == 0:
+        for line in (r.stdout or "").splitlines():
+            dev, _, typ = line.partition(":")
+            if typ.strip() == "wifi" and not dev.strip().startswith("p2p"):
+                return dev.strip()
+    return "wlo1"
+
+WIFI_IFACE = detect_wifi_iface()
+
+# 5 GHz channels that are safe for an access point in Kenya (no DFS, no "no IR")
+GHZ5_AP_CHANNELS = ["36", "40", "44", "48", "149", "153", "157", "161"]
+
+def ghz5_channels():
+    """Parse `iw list` -> [(channel, usable_as_ap)] for the 5 GHz band."""
+    r = run_cmd(["iw", "list"])
+    if not r or r.returncode != 0:
+        return []
+    in_band, out = False, []
+    for line in r.stdout.splitlines():
+        s = line.strip()
+        if s.startswith("Band 2"):
+            in_band = True; continue
+        if s.startswith("Band ") and not s.startswith("Band 2"):
+            in_band = False; continue
+        if in_band and s.startswith("*") and "MHz" in s:
+            m = re.search(r"\[(\d+)\]", s)
+            if m:
+                out.append((m.group(1), "no IR" not in s and "radar detection" not in s))
+    return out
+
+def ghz5_status():
+    """(usable_channels, total_channels, hint)"""
+    chans = ghz5_channels()
+    if not chans:
+        return [], 0, "This Wi-Fi card reports no 5 GHz channels."
+    usable = [c for c, ok in chans if ok]
+    if usable:
+        return usable, len(chans), ""
+    return [], len(chans), ("The driver is holding 5 GHz in “no IR” state "
+                            "(no initiate radiation), so no access point can start there.")
 
 def is_hotspot_active():
     r = run_cmd(["nmcli", "-t", "-f", "NAME,STATE", "connection", "show"])
@@ -117,6 +162,97 @@ def ensure_iface_up():
         import time; time.sleep(1)
     run_cmd(["rfkill", "unblock", "wlan"])
 
+# ---------------------------------------------------------------------------
+# USB tether: the phone gets internet from this laptop's Ethernet over the
+# USB cable (Gnirehtet relay + Android VPN client). Zero Wi-Fi involved, so
+# Bluetooth and Wi-Fi stop fighting over the 2.4 GHz band.
+# ---------------------------------------------------------------------------
+GNIREHTET_DIR = os.path.expanduser("~/.local/share/pop-hotspot/gnirehtet")
+GNIREHTET_BIN = os.path.join(GNIREHTET_DIR, "gnirehtet")
+GNIREHTET_PKG = "com.genymobile.gnirehtet"
+TETHER_PID_FILE = os.path.join(CONFIG_DIR, "tether.pid")
+TETHER_LOG_FILE = os.path.join(CONFIG_DIR, "tether.log")
+
+def adb_devices():
+    """Serials of adb devices that are authorised and ready."""
+    r = run_cmd(["adb", "devices"], timeout=15)
+    devs = []
+    if r and r.returncode == 0:
+        for line in (r.stdout or "").splitlines()[1:]:
+            p = line.split()
+            if len(p) >= 2 and p[1] == "device":
+                devs.append(p[0])
+    return devs
+
+def tether_client_up():
+    """True when the phone actually has the gnirehtet VPN interface up."""
+    r = run_cmd(["adb", "shell", "ip", "-brief", "addr", "show", "tun0"], timeout=10)
+    return bool(r and r.returncode == 0 and "10.0.0.2" in (r.stdout or ""))
+
+def tether_relay_pid():
+    try:
+        pid = int(open(TETHER_PID_FILE).read().strip())
+        os.kill(pid, 0)
+        return pid
+    except Exception:
+        return None
+
+def tether_connections():
+    """Approximate number of open tunnels (Open minus Close in the relay log)."""
+    try:
+        lines = open(TETHER_LOG_FILE, errors="ignore").read().splitlines()[-400:]
+    except OSError:
+        return 0
+    return max(0, sum(" Open" in l for l in lines) - sum(" Close" in l for l in lines))
+
+def tether_start():
+    global last_error
+    if not os.path.exists(GNIREHTET_BIN):
+        last_error = f"gnirehtet engine missing at {GNIREHTET_DIR}"
+        return False
+    devs = adb_devices()
+    if not devs:
+        last_error = "No phone on USB — plug the cable in and allow USB debugging."
+        return False
+    serial = config.get("tether_serial") or devs[0]
+    r = run_cmd(["adb", "shell", "pm", "list", "packages"], timeout=15)
+    if not r or GNIREHTET_PKG not in (r.stdout or ""):
+        run_cmd([GNIREHTET_BIN, "install", serial], timeout=120, cwd=GNIREHTET_DIR)
+    if not tether_relay_pid():
+        log = open(TETHER_LOG_FILE, "ab", buffering=0)
+        p = subprocess.Popen([GNIREHTET_BIN, "relay"], cwd=GNIREHTET_DIR,
+                             stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        open(TETHER_PID_FILE, "w").write(str(p.pid))
+        time.sleep(1.5)
+    run_cmd([GNIREHTET_BIN, "start", serial], timeout=30, cwd=GNIREHTET_DIR)
+    for _ in range(24):
+        if tether_client_up():
+            last_error = ""
+            return True
+        time.sleep(0.5)
+    last_error = ("Phone did not bring the tunnel up — accept the VPN request "
+                  "on the phone screen, then try again.")
+    return False
+
+def tether_stop():
+    global last_error
+    devs = adb_devices()
+    if devs:
+        run_cmd([GNIREHTET_BIN, "stop", config.get("tether_serial") or devs[0]],
+                timeout=20, cwd=GNIREHTET_DIR)
+    pid = tether_relay_pid()
+    if pid:
+        try:
+            os.kill(pid, 15)
+        except Exception:
+            pass
+    try:
+        os.remove(TETHER_PID_FILE)
+    except OSError:
+        pass
+    last_error = ""
+    return True
+
 def turn_on_hotspot():
     ensure_iface_up()
     if conn_exists():
@@ -139,15 +275,37 @@ def turn_on_hotspot():
             "wifi-sec.psk", config["password"],
         ]
         band = config.get("band", "auto")
-        if band != "auto":
+        chan = str(config.get("channel") or "auto").strip()
+        if band == "a":
+            usable, total, hint = ghz5_status()
+            if chan in ("", "auto", "0"):
+                chan = usable[0] if usable else "36"
+            modify_cmd.extend(["802-11-wireless.band", "a",
+                               "802-11-wireless.channel", chan])
+        elif band != "auto":
             modify_cmd.extend(["802-11-wireless.band", band])
+            if chan not in ("", "auto", "0"):
+                modify_cmd.extend(["802-11-wireless.channel", chan])
         run_cmd(modify_cmd)
-    up = run_cmd(["nmcli", "connection", "up", CONN_NAME])
+    up = run_cmd(["nmcli", "connection", "up", CONN_NAME], timeout=45)
     if up and up.returncode != 0:
         reset_wifi_iface()
-        up = run_cmd(["nmcli", "connection", "up", CONN_NAME])
+        up = run_cmd(["nmcli", "connection", "up", CONN_NAME], timeout=45)
+    ok = bool(up and up.returncode == 0)
+    global last_error
+    if ok:
+        last_error = ""
+    else:
+        band = config.get("band", "auto")
+        err = (up.stderr or "").strip().splitlines()[-1] if up and (up.stderr or "").strip() else "nmcli could not activate the hotspot"
+        if band == "a":
+            usable, total, hint = ghz5_status()
+            last_error = (f"5 GHz could not start: {hint} " if not usable else f"5 GHz could not start: {err} ") + \
+                         "See Settings → Prepare 5 GHz."
+        else:
+            last_error = err
     apply_iptables_block()
-    return up and up.returncode == 0
+    return ok
 
 def turn_off_hotspot():
     r = run_cmd(["nmcli", "connection", "down", CONN_NAME])
@@ -160,7 +318,7 @@ class HotspotApp(Gtk.Window):
         self.set_border_width(0)
         self.set_default_size(480, 500)
         self.set_position(Gtk.WindowPosition.CENTER)
-        self.connect("destroy", Gtk.main_quit)
+        self.connect("destroy", self.on_destroy)
         self.blocked_set = set(blocked)
 
         header = Gtk.HeaderBar()
@@ -182,7 +340,9 @@ class HotspotApp(Gtk.Window):
 
         self.block_confirm_mac = None
         self.refresh()
+        self.update_tether_ui()
         GLib.timeout_add_seconds(5, self.refresh_clients)
+        GLib.timeout_add_seconds(10, self.poll_tether)
 
     def build_main_page(self):
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -202,6 +362,25 @@ class HotspotApp(Gtk.Window):
         top.pack_start(sb, False, False, 0)
         self.switch.connect("notify::active", self.on_switch)
         vbox.pack_start(top, False, False, 0)
+
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        vbox.pack_start(sep, False, False, 0)
+
+        tbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=16)
+        tbox.pack_start(Gtk.Label(xalign=0, use_markup=True,
+            label="<b>USB Tether</b> — share this laptop's internet with the phone over the cable"),
+            False, False, 0)
+        trow = Gtk.Box(spacing=8)
+        self.tether_switch = Gtk.Switch()
+        self.tether_switch.connect("notify::active", self.on_tether_switch)
+        trow.pack_start(self.tether_switch, False, False, 0)
+        self.tether_label = Gtk.Label(xalign=0)
+        trow.pack_start(self.tether_label, True, True, 0)
+        tbox.pack_start(trow, False, False, 0)
+        tbox.pack_start(Gtk.Label(xalign=0, use_markup=True,
+            label="<small>Bluetooth stays on 2.4 GHz alone, so it stops slowing Wi-Fi down. "
+                  "Needs the USB cable + USB debugging.</small>"), False, False, 0)
+        vbox.pack_start(tbox, False, False, 0)
 
         sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
         vbox.pack_start(sep, False, False, 0)
@@ -264,6 +443,31 @@ class HotspotApp(Gtk.Window):
         row_band.pack_start(self.band_combo, True, True, 0)
         settings_box.pack_start(row_band, False, False, 0)
 
+        row_chan = Gtk.Box(spacing=8)
+        row_chan.pack_start(Gtk.Label(label="Channel:", width_chars=10), False, False, 0)
+        self.chan_combo = Gtk.ComboBoxText()
+        for val, label in [("auto", "Auto"), ("36", "36 (5 GHz)"), ("40", "40 (5 GHz)"),
+                           ("44", "44 (5 GHz)"), ("48", "48 (5 GHz)"), ("149", "149 (5 GHz)"),
+                           ("1", "1 (2.4 GHz)"), ("6", "6 (2.4 GHz)"), ("11", "11 (2.4 GHz)")]:
+            self.chan_combo.append(val, label)
+        self.chan_combo.set_active_id(str(config.get("channel", "auto")))
+        row_chan.pack_start(self.chan_combo, True, True, 0)
+        settings_box.pack_start(row_chan, False, False, 0)
+
+        self.ghz5_label = Gtk.Label(xalign=0)
+        self.ghz5_label.set_line_wrap(True)
+        settings_box.pack_start(self.ghz5_label, False, False, 0)
+        self.update_ghz5_label()
+
+        prep_btn = Gtk.Button(label="Prepare / check 5 GHz (admin)")
+        prep_btn.connect("clicked", self.prepare_5ghz)
+        settings_box.pack_start(prep_btn, False, False, 0)
+
+        self.persist_check = Gtk.CheckButton(
+            label="Keep USB tether running after closing this window")
+        self.persist_check.set_active(bool(config.get("tether_persist", False)))
+        settings_box.pack_start(self.persist_check, False, False, 0)
+
         hb = Gtk.Box(spacing=8)
         show_btn = Gtk.Button(label="Show")
         show_btn.connect("clicked", lambda w: self.pass_entry.set_visibility(
@@ -307,6 +511,94 @@ class HotspotApp(Gtk.Window):
 
     def run_cmd(self, cmd):
         return run_cmd(cmd)
+
+    def on_destroy(self, w):
+        if not config.get("tether_persist", False) and (tether_client_up() or tether_relay_pid()):
+            tether_stop()
+        Gtk.main_quit()
+
+    def poll_tether(self):
+        self.update_tether_ui()
+        return True
+
+    def on_tether_switch(self, switch, gparam):
+        if not switch.get_sensitive():
+            return
+        self.tether_switch.set_sensitive(False)
+        target = switch.get_active()
+        self.tether_label.set_markup(f"<b>⏳ {'Starting' if target else 'Stopping'}…</b>")
+        def worker():
+            ok = tether_start() if target else tether_stop()
+            if not ok:
+                GLib.idle_add(self._dialog, "USB Tether", last_error)
+            GLib.idle_add(self.update_tether_ui)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def update_tether_ui(self):
+        active = tether_client_up()
+        if active:
+            n = tether_connections()
+            self.tether_label.set_markup(
+                "<b>🟢 Active</b>" + (f" — {n} open connection{'s' if n != 1 else ''}" if n else ""))
+        else:
+            self.tether_label.set_markup("<b>🔴 Off</b>")
+        self.tether_switch.handler_block_by_func(self.on_tether_switch)
+        self.tether_switch.set_active(active)
+        self.tether_switch.handler_unblock_by_func(self.on_tether_switch)
+        self.tether_switch.set_sensitive(True)
+        return False
+
+    def update_ghz5_label(self):
+        usable, total, hint = ghz5_status()
+        if usable:
+            self.ghz5_label.set_markup(
+                f"<small>5 GHz: <b>ready</b> (channels {', '.join(usable[:5])})</small>")
+        elif total:
+            self.ghz5_label.set_markup(
+                f"<small>5 GHz: <b>blocked by driver</b> — all {total} channels are “no IR”</small>")
+        else:
+            self.ghz5_label.set_markup("<small>5 GHz: card reports none</small>")
+
+    def prepare_5ghz(self, w):
+        """Ask for the admin password once: stop the AP, scan every band so the
+        driver can learn the country, then report what this card actually allows."""
+        script = ("nmcli connection down PopHotspot >/dev/null 2>&1; "
+                  f"ip link set {WIFI_IFACE} up; sleep 1; "
+                  f"{{ iw dev {WIFI_IFACE} scan; iw reg get; iw list; dmesg; }} "
+                  "> /tmp/pop-hotspot-5ghz.txt 2>&1; chmod 644 /tmp/pop-hotspot-5ghz.txt")
+        try:
+            subprocess.Popen(["pkexec", "bash", "-c", script])
+        except FileNotFoundError:
+            self._dialog("pkexec not available",
+                         "Run this in a terminal instead:\n\nsudo bash -c '%s'" % script)
+            return
+        GLib.timeout_add_seconds(8, self._after_prepare)
+
+    def _after_prepare(self):
+        try:
+            txt = open("/tmp/pop-hotspot-5ghz.txt").read()
+        except OSError:
+            self._dialog("5 GHz check", "No result file — did the admin prompt get cancelled?")
+            return False
+        heard = len(re.findall(r"^freq: 5\d{3}", txt, re.M))
+        usable, total, hint = ghz5_status()
+        self.update_ghz5_label()
+        msg = (f"5 GHz access points heard while scanning: {heard}\n"
+               f"Channels usable for a 5 GHz hotspot: "
+               f"{', '.join(usable) if usable else 'none (' + str(total) + ' × “no IR”)'}")
+        if not usable:
+            msg += ("\n\n" + hint +
+                    "\n\nOptions: use a 5 GHz-capable USB Wi-Fi adapter, or stay on "
+                    "2.4 GHz and switch Bluetooth off while you need throughput.")
+        self._dialog("5 GHz check", msg)
+        return False
+
+    def _dialog(self, title, text):
+        d = Gtk.MessageDialog(transient_for=self, modal=True,
+                              message_type=Gtk.MessageType.INFO,
+                              buttons=Gtk.ButtonsType.OK, text=title)
+        d.format_secondary_text(text)
+        d.run(); d.destroy()
 
     def is_active(self):
         return is_hotspot_active()
@@ -352,8 +644,9 @@ class HotspotApp(Gtk.Window):
     def poll_operation(self, target_active, tries=0):
         if tries > 30:
             actual = self.is_active()
+            detail = f"\n<small>{last_error}</small>" if last_error else ""
             self.status_label.set_markup(
-                f"<b>⚠️ Timed out (try Settings → Save & Recreate)</b>"
+                f"<b>⚠️ Timed out</b>{detail}"
             )
             self.switch.set_sensitive(True)
             self.switch.handler_block_by_func(self.on_switch)
@@ -444,9 +737,12 @@ class HotspotApp(Gtk.Window):
         config["ssid"] = new_ssid
         config["password"] = new_pass
         config["band"] = self.band_combo.get_active_id() or "auto"
+        config["channel"] = self.chan_combo.get_active_id() or "auto"
+        config["tether_persist"] = bool(self.persist_check.get_active())
         save_json(CONFIG_FILE, config)
         if was_active:
             turn_on_hotspot()
+        self.update_ghz5_label()
         dialog = Gtk.MessageDialog(transient_for=self, modal=True,
             message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK,
             text="Settings saved. Hotspot recreated.")
