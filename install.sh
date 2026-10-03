@@ -156,6 +156,36 @@ if [ -f "$SRC_DIR/pop-hotspot-ap" ]; then
     echo "    want it on at boot?  sudo systemctl enable pop-hotspot-ap"
 fi
 
+# ------------------------------------------------------------------- casting
+# "Cast to TV" needs gnome-network-displays (Miracast), and NetworkManager must
+# keep its hands off the Wi-Fi P2P device or the caster cannot create a P2P link.
+if [ -f "$SRC_DIR/pop-cast" ]; then
+    say "Installing screen casting (Miracast)"
+    dpkg -s gnome-network-displays >/dev/null 2>&1 || {
+        printf '    gnome-network-displays is missing — install now? [Y/n] '
+        read -r reply </dev/tty || reply=n
+        case "$reply" in
+            [nN]*) echo "    skipped — the Cast button will not work" ;;
+            *)     sudo apt-get install -y gnome-network-displays ;;
+        esac
+    }
+    install -m 755 "$SRC_DIR/pop-cast" "$HOME/.local/bin/pop-cast"
+    if [ -f /etc/NetworkManager/conf.d/99-p2p-unmanaged.conf ]; then
+        echo "    P2P already reserved for the caster"
+    else
+        sudo install -m 644 "$SRC_DIR/nm-conf/99-p2p-unmanaged.conf" \
+             /etc/NetworkManager/conf.d/99-p2p-unmanaged.conf
+        sudo nmcli general reload >/dev/null 2>&1 || true
+        echo "    reserved Wi-Fi P2P for the caster (NetworkManager 1.44+ would steal it)"
+    fi
+    mkdir -p "$HOME/.config/xdg-desktop-portal"
+    if [ ! -f "$HOME/.config/xdg-desktop-portal/portals.conf" ]; then
+        printf '[preferred]\nscreencast=cosmic\nscreen-cast=cosmic\nremote-desktop=cosmic\n' \
+            > "$HOME/.config/xdg-desktop-portal/portals.conf"
+        echo "    pinned ScreenCast to the COSMIC portal backend"
+    fi
+fi
+
 say "Done."
 echo "    Pop Hotspot  : launch from your app menu, or run: pop-hotspot"
 echo "    USB tether   : toggle it inside Pop Hotspot (needs the USB cable + USB debugging)"

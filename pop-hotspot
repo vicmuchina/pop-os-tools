@@ -439,6 +439,29 @@ class HotspotApp(Gtk.Window):
         sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
         vbox.pack_start(sep, False, False, 0)
 
+        # ── Cast to TV (Miracast) ────────────────────────────────────────────
+        cbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=16)
+        cbox.pack_start(Gtk.Label(xalign=0, use_markup=True,
+            label="<b>Cast to TV</b> — mirror this screen over Wi-Fi (Miracast)"), False, False, 0)
+        crow = Gtk.Box(spacing=8)
+        self.cast_button = Gtk.Button(label="Start casting…")
+        self.cast_button.connect("clicked", self.on_cast)
+        crow.pack_start(self.cast_button, False, False, 0)
+        self.cast_label = Gtk.Label(xalign=0, use_markup=True,
+            label="<small>Put the TV in Screen Mirroring / Miracast mode first.</small>")
+        self.cast_label.set_line_wrap(True)
+        crow.pack_start(self.cast_label, True, True, 0)
+        cbox.pack_start(crow, False, False, 0)
+        cbox.pack_start(Gtk.Label(xalign=0, use_markup=True,
+            label="<small>The Wi-Fi card can be an access point <i>or</i> a Miracast sender, never both — "
+                  "so the hotspot turns off while you cast and comes back when you close the "
+                  "casting window (the laptop stays online over the cable).</small>"),
+            False, False, 0)
+        vbox.pack_start(cbox, False, False, 0)
+
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        vbox.pack_start(sep, False, False, 0)
+
         tbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=16)
         tbox.pack_start(Gtk.Label(xalign=0, use_markup=True,
             label="<b>USB Tether</b> — share this laptop's internet with the phone over the cable"),
@@ -606,6 +629,22 @@ class HotspotApp(Gtk.Window):
     def poll_tether(self):
         self.update_tether_ui()
         return True
+
+    def on_cast(self, button):
+        """Launch pop-cast: it stops the hotspot, runs the Miracast caster, and
+        restores the hotspot when the casting window is closed."""
+        script = os.path.expanduser("~/.local/bin/pop-cast")
+        if not os.path.exists(script):
+            self.cast_label.set_markup("<small>pop-cast is not installed.</small>")
+            return
+        try:
+            subprocess.Popen([script], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            self.cast_label.set_markup(
+                "<small>Started — pick your TV in the window that opened. The hotspot "
+                "returns when you close it.</small>")
+        except Exception as e:  # noqa: BLE001 — surface any launch failure in the UI
+            self.cast_label.set_markup(f"<small>Could not start casting: {e}</small>")
 
     def on_tether_switch(self, switch, gparam):
         if not switch.get_sensitive():

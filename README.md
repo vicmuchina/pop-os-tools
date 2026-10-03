@@ -95,6 +95,39 @@ hostapd log (`/run/pop-hotspot/hostapd.log`) records every attempt, including
 
 ---
 
+### Cast to TV (Miracast)
+
+**Start casting…** in the app (or run `pop-cast`) mirrors this screen to a
+Miracast sink — most smart TVs — and brings the hotspot back when you close the
+casting window.
+
+What matters, learned the hard way:
+
+* **Miracast is Wi-Fi Direct**: a direct laptop ↔ TV link. How the TV gets its
+  internet (this hotspot, a router, an ethernet cable) does not affect casting.
+* The Wi-Fi card can be an **access point *or* a P2P sender, never both**
+  (`#{ AP, P2P-client, P2P-GO } <= 1`), so the hotspot is stopped while casting.
+  The laptop itself stays online over its cable — only the AP goes down.
+* A TV on this hotspot **loses internet during a cast** (its single radio leaves
+  the AP to build the direct link). A TV cabled to the router keeps internet.
+* The TV must be in its **Screen Mirroring / Miracast / Wireless Display** mode,
+  otherwise it never advertises itself as a sink and the list stays empty.
+* Requirements: `gnome-network-displays`, a P2P-capable wpa_supplicant, and a
+  working **ScreenCast portal**. Check it with:
+
+  ```bash
+  busctl --user introspect org.freedesktop.portal.Desktop \
+      /org/freedesktop/portal/desktop | grep ScreenCast
+  ```
+
+  On COSMIC the backend is `xdg-desktop-portal-cosmic`. `xdg-desktop-portal` can
+  start *before* that backend registers and then expose **no ScreenCast at all**
+  (which breaks every screen recorder, not just casting) — `systemctl --user
+  restart xdg-desktop-portal` fixes it; we also pin it in
+  `~/.config/xdg-desktop-portal/portals.conf`.
+* NetworkManager ≥ 1.44 manages Wi-Fi P2P devices and breaks the caster, so
+  `install.sh` installs `/etc/NetworkManager/conf.d/99-p2p-unmanaged.conf`.
+
 ## USB Tether — setup and use
 
 1. Plug the phone in over USB and enable **USB debugging** on it.
@@ -165,6 +198,8 @@ Three real fixes, best first:
 | `~/.config/pop-hotspot/config.json` | SSID, password, band, channel, tether preferences |
 | `~/.config/pop-hotspot/blocked.json` | blocked client MACs |
 | `~/.local/share/pop-hotspot/gnirehtet/` | tether engine + phone APK |
+| `~/.local/bin/pop-cast` | cast this screen to a Miracast TV, restoring the hotspot afterwards |
+| `/etc/NetworkManager/conf.d/99-p2p-unmanaged.conf` | keeps NM off the Wi-Fi P2P device so casting works |
 | `~/.local/share/pop-hotspot/hostapd.conf` | generated AP config (SSID/password/channel) for the hostapd backend |
 | `/usr/local/sbin/pop-hotspot-ap` | AP controller: hostapd + dnsmasq + NAT (installed by `install.sh`) |
 | `/etc/systemd/system/pop-hotspot-ap.service` | runs the AP controller as root |
