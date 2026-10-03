@@ -12,6 +12,5 @@ ExecStart=/usr/local/sbin/pop-hotspot-ap start
 ExecStop=/usr/local/sbin/pop-hotspot-ap stop
 Restart=no
 
-# Optional: uncomment to have the hotspot come up at boot.
-# [Install]
-# WantedBy=multi-user.target
+[Install]
+WantedBy=multi-user.target

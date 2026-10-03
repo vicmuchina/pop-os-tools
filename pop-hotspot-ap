@@ -39,8 +39,24 @@ upstream_iface() { ip route | awk '/^default/ {print $5; exit}'; }
 start() {
     [ -f "$CONF" ] || die "missing $CONF (run install.sh)"
 
-    # regenerate the dnsmasq config each time (upstream interface may change)
-    local up; up="$(upstream_iface)"; [ -n "$up" ] || die "no default route / no internet upstream"
+    # Find the internet-facing interface. At boot this can briefly be empty, so
+    # retry, then fall back to a wired interface: the AP should still come up
+    # (clients get DHCP) even if NAT has to catch up.
+    local up="" i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        up="$(ip route | awk '/^default/ {print $5; exit}')"
+        [ -n "$up" ] && break
+        sleep 3
+    done
+    if [ -z "$up" ]; then
+        for cand in $(ls /sys/class/net); do
+            case "$cand" in
+                lo|"$IFACE"|docker*|br-*|veth*|virbr*) continue ;;
+            esac
+            [ "$(cat /sys/class/net/$cand/operstate 2>/dev/null)" = "up" ] && { up="$cand"; break; }
+        done
+    fi
+    log "upstream interface: ${up:-none} (NAT ${up:+via $up})"
 
     # hand the interface to us
     nmcli device set "$IFACE" managed no 2>/dev/null || true
@@ -65,14 +81,16 @@ start() {
     sleep 1
 
     # NAT for clients → internet
+    if [ -n "$up" ]; then
     iptables -t nat -C POSTROUTING -s "${CIDR%.*}.0/24" -o "$up" -j MASQUERADE 2>/dev/null \
         || iptables -t nat -A POSTROUTING -s "${CIDR%.*}.0/24" -o "$up" -j MASQUERADE
     iptables -C FORWARD -i "$IFACE" -o "$up" -j ACCEPT 2>/dev/null \
         || iptables -A FORWARD -i "$IFACE" -o "$up" -j ACCEPT
     iptables -C FORWARD -i "$up" -o "$IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
         || iptables -A FORWARD -i "$up" -o "$IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    fi
 
-    log "AP up: ssid $(nmcli -g 802-11-wireless.ssid con show PopHotspot 2>/dev/null || echo AlienWare) on $IFACE ($CIDR), NAT via $up"
+    log "AP up on $IFACE ($CIDR), NAT via ${up:-none}"
     log "hostapd pid $(cat "$HOSTAPD_PID" 2>/dev/null), dnsmasq pid $(cat "$DNSMASQ_PID" 2>/dev/null)"
 }
 
