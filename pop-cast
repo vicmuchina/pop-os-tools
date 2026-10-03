@@ -1,43 +1,53 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  pop-cast — mirror this screen to a Miracast sink (Smart TV) over Wi-Fi.
+#  pop-cast — mirror this screen to the TV.
 #
-#  Miracast uses Wi-Fi Direct (P2P). The Intel 7265 radio can be an AP *or* a
-#  P2P peer — never both at once — so the hotspot is stopped for the duration
-#  of the cast and restored when you close the casting window.
+#    pop-cast              LAN mode (default): cast to a receiver app running on
+#                          the TV (Chromecast / AirPlay / DLNA via e.g. AirScreen).
+#                          The hotspot STAYS UP — casting travels over Wi-Fi.
+#    pop-cast --miracast   Wi-Fi Direct mode: for TVs that only do Miracast.
+#                          Frees the Wi-Fi radio (hotspot off), restores it after.
 #
-#  Before running: put the TV in its Screen Mirroring / Miracast / Wireless
-#  Display mode, otherwise it will not advertise itself as a sink.
+#  Why the difference: the Intel radio can be an access point *or* a Wi-Fi Direct
+#  peer, never both (#{ AP, P2P-client, P2P-GO } <= 1). Casting over the LAN
+#  avoids Wi-Fi Direct entirely — so the hotspot and the TV's internet survive.
 # ============================================================================
 set -u
 
 HOTSPOT_UNIT="pop-hotspot-ap"
 APP="${CAST_APP:-gnome-network-displays}"
-restore=0
+MODE="lan"
+case "${1:-}" in
+    --miracast|--p2p) MODE="miracast"; shift ;;
+    --lan)            MODE="lan";      shift ;;
+esac
 
 say() { printf '%s\n' "$*"; }
 
-if ! command -v "$APP" >/dev/null; then
-    say "error: $APP is not installed.  sudo apt install gnome-network-displays"
-    exit 1
-fi
+command -v "$APP" >/dev/null || {
+    say "error: $APP is not installed.  sudo apt install gnome-network-displays"; exit 1; }
 
-if systemctl is-active --quiet "$HOTSPOT_UNIT"; then
-    restore=1
-    say "• Freeing the Wi-Fi radio: stopping the hotspot (the TV will drop off the network)."
-    systemctl stop "$HOTSPOT_UNIT" || { say "error: could not stop $HOTSPOT_UNIT"; exit 1; }
-    # hostapd needs a moment to release the interface before P2P can use it
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        iw dev wlo1 info 2>/dev/null | grep -q "type AP" || break
-        sleep 1
-    done
-    say "• Radio is free — starting the caster."
+restore=0
+if [ "$MODE" = "miracast" ]; then
+    if systemctl is-active --quiet "$HOTSPOT_UNIT"; then
+        restore=1
+        say "• Miracast needs the Wi-Fi radio: stopping the hotspot (the TV drops off the network)."
+        systemctl stop "$HOTSPOT_UNIT" || { say "error: cannot stop $HOTSPOT_UNIT"; exit 1; }
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            iw dev wlo1 info 2>/dev/null | grep -q "type AP" || break
+            sleep 1
+        done
+    fi
+    say "• Pick your TV in the window (make sure its Screen Mirroring mode is open)."
 else
-    say "• Hotspot already off — starting the caster."
+    if ! systemctl is-active --quiet "$HOTSPOT_UNIT"; then
+        say "• Hotspot is off — turning it on so the TV can be reached over the network."
+        systemctl start "$HOTSPOT_UNIT" || true
+        sleep 3
+    fi
+    say "• Casting over the network — the hotspot stays up."
+    say "  Start your receiver app on the TV (e.g. AirScreen → Cast), then pick it below."
 fi
-
-say "• Pick your TV in the window. (If the list is empty, press Refresh after"
-say "  enabling Screen Mirroring / Miracast on the TV.)"
 
 "$APP" "$@"
 rc=$?

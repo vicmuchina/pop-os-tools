@@ -442,13 +442,13 @@ class HotspotApp(Gtk.Window):
         # ── Cast to TV (Miracast) ────────────────────────────────────────────
         cbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=16)
         cbox.pack_start(Gtk.Label(xalign=0, use_markup=True,
-            label="<b>Cast to TV</b> — mirror this screen over Wi-Fi (Miracast)"), False, False, 0)
+            label="<b>Cast to TV</b> — mirror this screen to the TV"), False, False, 0)
         crow = Gtk.Box(spacing=8)
         self.cast_button = Gtk.Button(label="Start casting…")
         self.cast_button.connect("clicked", self.on_cast)
         crow.pack_start(self.cast_button, False, False, 0)
         self.cast_label = Gtk.Label(xalign=0, use_markup=True,
-            label="<small>Put the TV in Screen Mirroring / Miracast mode first.</small>")
+            label="<small>Start the TV's receiver app (e.g. AirScreen → Cast) first.</small>")
         self.cast_label.set_line_wrap(True)
         crow.pack_start(self.cast_label, True, True, 0)
         cbox.pack_start(crow, False, False, 0)
