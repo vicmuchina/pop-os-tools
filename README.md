@@ -51,8 +51,47 @@ is attached.
 
 ```bash
 sudo apt install python3-gi network-manager iw rfkill iptables curl unzip \
-                 android-tools-adb brightnessctl
+                 android-tools-adb brightnessctl hostapd dnsmasq
 ```
+
+### TV-compatible access point (hostapd)
+
+NetworkManager builds its hotspot on **wpa_supplicant's AP mode**, which is the
+least compatible AP implementation there is. Some clients — smart TVs in
+particular — **never even try to associate** with it. That is not a password or
+band problem: the AP's beacons lack the legacy 802.11b/g rate set and basic
+capability flags those clients expect, so they silently ignore the network
+(meanwhile phones and laptops connect fine).
+
+Pop Hotspot therefore ships a second backend: a real **hostapd** access point
+plus `dnsmasq` for DHCP/DNS and iptables NAT, controlled by the app's switch.
+
+* `pop-hotspot-ap` — the AP controller (`start` / `stop` / `status`), installed to `/usr/local/sbin` (root-owned).
+* `systemd/pop-hotspot-ap.service` — runs it as root (`Type=oneshot`, `RemainAfterExit=yes`).
+* `polkit/49-pop-hotspot-ap.rules` — lets your desktop user start/stop **only** that unit, so the app toggles the hotspot with **no password prompt**.
+
+Pick the backend in **Settings → AP backend**:
+
+| Backend | Works best with |
+|---|---|
+| `hostapd` (default) | everything, including TVs, Android TV sticks, consoles |
+| `NetworkManager` | phones/laptops; use if hostapd isn't installed |
+
+The SSID, password, band and channel from Settings are rendered into
+`~/.local/share/pop-hotspot/hostapd.conf` every time the hotspot starts, so
+**Save & Recreate** applies to both backends.
+
+Useful commands:
+
+```bash
+/usr/local/sbin/pop-hotspot-ap status   # ap=yes, ssid, channel, client count
+systemctl status pop-hotspot-ap                # service state (journal: root's logs)
+sudo systemctl enable pop-hotspot-ap           # optional: bring the AP up at boot
+```
+
+If the TV still refuses: forget the network on the TV, then connect again. The
+hostapd log (`/run/pop-hotspot/hostapd.log`) records every attempt, including
+`EAPOL-4WAY-HS-COMPLETED` (success) or the exact reason for rejection.
 
 ---
 
@@ -126,6 +165,11 @@ Three real fixes, best first:
 | `~/.config/pop-hotspot/config.json` | SSID, password, band, channel, tether preferences |
 | `~/.config/pop-hotspot/blocked.json` | blocked client MACs |
 | `~/.local/share/pop-hotspot/gnirehtet/` | tether engine + phone APK |
+| `~/.local/share/pop-hotspot/hostapd.conf` | generated AP config (SSID/password/channel) for the hostapd backend |
+| `/usr/local/sbin/pop-hotspot-ap` | AP controller: hostapd + dnsmasq + NAT (installed by `install.sh`) |
+| `/etc/systemd/system/pop-hotspot-ap.service` | runs the AP controller as root |
+| `/etc/polkit-1/rules.d/49-pop-hotspot-ap.rules` | lets your user toggle that unit with no password |
+| `/run/pop-hotspot/hostapd.log` | live AP log — every client association attempt |
 
 ## Troubleshooting
 

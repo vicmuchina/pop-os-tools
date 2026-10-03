@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  pop-hotspot-ap — hostapd-backed access point for Pop Hotspot
+#
+#  Why this exists: NetworkManager runs APs through wpa_supplicant's AP mode,
+#  which is the least-compatible AP implementation — budget TVs (Vitron,
+#  Android TV sticks, consoles) often refuse it. hostapd advertises legacy
+#  802.11b/g rates, WMM and proper beacons, so those clients connect.
+#
+#  Usage:  pop-hotspot-ap start|stop|status|restart
+#
+#  Needs CAP_NET_ADMIN (+ CAP_NET_RAW for hostapd, CAP_NET_BIND_SERVICE for
+#  dnsmasq). The systemd user unit pop-hotspot-ap.service grants exactly those,
+#  so the GUI app can toggle it without a password and without sudo.
+# ============================================================================
+set -u
+
+IFACE="${IFACE:-wlo1}"
+GW="${GW:-10.42.0.1}"
+CIDR="${GW}/24"
+HOME_DIR="${POP_HOTSPOT_HOME:-$HOME}"
+SSID_FILE="$HOME_DIR/.config/pop-hotspot/config.json"
+CONF="$HOME_DIR/.local/share/pop-hotspot/hostapd.conf"
+DNSMASQ_CONF="$HOME_DIR/.local/share/pop-hotspot/dnsmasq.conf"
+RUN_DIR="${POP_HOTSPOT_RUN_DIR:-/run/pop-hotspot}"
+HOSTAPD_PID="$RUN_DIR/hostapd.pid"
+DNSMASQ_PID="$RUN_DIR/dnsmasq.pid"
+HOSTAPD_LOG="$RUN_DIR/hostapd.log"
+DNSMASQ_LOG="$RUN_DIR/dnsmasq.log"
+
+mkdir -p "$RUN_DIR"
+
+log() { printf '%s\n' "$*"; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+upstream_iface() { ip route | awk '/^default/ {print $5; exit}'; }
+
+# ── start ────────────────────────────────────────────────────────────────────
+start() {
+    [ -f "$CONF" ] || die "missing $CONF (run install.sh)"
+
+    # regenerate the dnsmasq config each time (upstream interface may change)
+    local up; up="$(upstream_iface)"; [ -n "$up" ] || die "no default route / no internet upstream"
+
+    # hand the interface to us
+    nmcli device set "$IFACE" managed no 2>/dev/null || true
+    ip addr flush dev "$IFACE" 2>/dev/null || true
+    ip addr add "$CIDR" dev "$IFACE" || die "cannot set $CIDR on $IFACE"
+    ip link set "$IFACE" up
+    sysctl -qw net.ipv4.ip_forward=1 2>/dev/null || true
+
+    # the AP
+    hostapd -B -P "$HOSTAPD_PID" -f "$HOSTAPD_LOG" "$CONF" || die "hostapd failed (see $HOSTAPD_LOG)"
+    sleep 1
+
+    # DHCP + DNS for clients
+    dnsmasq --conf-file=/dev/null \
+            --interface="$IFACE" --bind-interfaces \
+            --dhcp-range="${CIDR%.*}.10,${CIDR%.*}.254,255.255.255.0,12h" \
+            --dhcp-option=3,"$GW" --dhcp-option=6,"$GW" \
+            --no-resolv --server=8.8.8.8 --server=1.1.1.1 \
+            --dhcp-authoritative \
+            --pid-file="$DNSMASQ_PID" --log-facility="$DNSMASQ_LOG" \
+        || die "dnsmasq failed (see $DNSMASQ_LOG)"
+    sleep 1
+
+    # NAT for clients → internet
+    iptables -t nat -C POSTROUTING -s "${CIDR%.*}.0/24" -o "$up" -j MASQUERADE 2>/dev/null \
+        || iptables -t nat -A POSTROUTING -s "${CIDR%.*}.0/24" -o "$up" -j MASQUERADE
+    iptables -C FORWARD -i "$IFACE" -o "$up" -j ACCEPT 2>/dev/null \
+        || iptables -A FORWARD -i "$IFACE" -o "$up" -j ACCEPT
+    iptables -C FORWARD -i "$up" -o "$IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+        || iptables -A FORWARD -i "$up" -o "$IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+    log "AP up: ssid $(nmcli -g 802-11-wireless.ssid con show PopHotspot 2>/dev/null || echo AlienWare) on $IFACE ($CIDR), NAT via $up"
+    log "hostapd pid $(cat "$HOSTAPD_PID" 2>/dev/null), dnsmasq pid $(cat "$DNSMASQ_PID" 2>/dev/null)"
+}
+
+# ── stop ─────────────────────────────────────────────────────────────────────
+stop() {
+    local up; up="$(upstream_iface)"
+    for f in "$HOSTAPD_PID" "$DNSMASQ_PID"; do
+        if [ -f "$f" ]; then
+            kill "$(cat "$f")" 2>/dev/null || true
+            rm -f "$f"
+        fi
+    done
+    sleep 1
+    [ -n "$up" ] && {
+        iptables -t nat -D POSTROUTING -s "${CIDR%.*}.0/24" -o "$up" -j MASQUERADE 2>/dev/null || true
+        iptables -D FORWARD -i "$IFACE" -o "$up" -j ACCEPT 2>/dev/null || true
+        iptables -D FORWARD -i "$up" -o "$IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    }
+    ip addr flush dev "$IFACE" 2>/dev/null || true
+    nmcli device set "$IFACE" managed yes 2>/dev/null || true
+    log "AP down; $IFACE returned to NetworkManager"
+}
+
+# ── status ───────────────────────────────────────────────────────────────────
+status() {
+    local hp dp; hp=$(cat "$HOSTAPD_PID" 2>/dev/null || echo); dp=$(cat "$DNSMASQ_PID" 2>/dev/null || echo)
+    # the interface being in AP mode is the reliable signal for an unprivileged
+    # caller (kill -0 on root's pid fails with EPERM and would report "down")
+    local up=no
+    iw dev "$IFACE" info 2>/dev/null | grep -q 'type AP' && up=yes
+    printf 'ap=%s hostapd_pid=%s dnsmasq_pid=%s iface=%s\n' "$up" "${hp:-none}" "${dp:-none}" "$IFACE"
+    iw dev "$IFACE" info 2>/dev/null | grep -E 'ssid|type|channel' | tr -s ' ' | sed 's/^/  /'
+    iw dev "$IFACE" station dump 2>/dev/null | grep -c '^Station' | sed 's/^/  clients: /'
+}
+
+case "${1:-status}" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; start ;;
+    status)  status ;;
+    *)       die "usage: $0 start|stop|restart|status" ;;
+esac

@@ -125,6 +125,37 @@ if [ "$WITH_BRIGHTNESS_SUDO" -eq 1 ] && [ -f "$SRC_DIR/pop-brightness" ]; then
     fi
 fi
 
+# ------------------------------------------------------------------ AP backend
+# The hotspot's preferred backend is hostapd. NetworkManager builds its AP on
+# wpa_supplicant's AP mode, which advertises no legacy 802.11b rates and only
+# basic capabilities — many TVs (Vitron, Android TV, consoles) simply never
+# associate with it. hostapd beacons properly, so it is the default.
+if [ -f "$SRC_DIR/pop-hotspot-ap" ]; then
+    say "Installing the hostapd AP backend (TV-compatible)"
+    missing=""
+    for pkg in hostapd dnsmasq; do
+        dpkg -s "$pkg" >/dev/null 2>&1 || missing="$missing $pkg"
+    done
+    if [ -n "$missing" ]; then
+        printf '    missing:%s — install now? [Y/n] ' "$missing"
+        read -r reply </dev/tty || reply=n
+        case "$reply" in
+            [nN]*) echo "    skipped — the app will fall back to NetworkManager" ;;
+            *)     sudo apt-get install -y $missing ;;
+        esac
+    fi
+    sudo install -m 755 "$SRC_DIR/pop-hotspot-ap" /usr/local/sbin/pop-hotspot-ap
+    sudo mkdir -p /etc/systemd/system /etc/polkit-1/rules.d
+    sed "s|@HOME@|$HOME|" "$SRC_DIR/systemd/pop-hotspot-ap.service" \
+        | sudo tee /etc/systemd/system/pop-hotspot-ap.service >/dev/null
+    sed "s|@USER@|$(whoami)|" "$SRC_DIR/polkit/49-pop-hotspot-ap.rules" \
+        | sudo tee /etc/polkit-1/rules.d/49-pop-hotspot-ap.rules >/dev/null
+    sudo systemctl daemon-reload
+    echo "    installed: /usr/local/sbin/pop-hotspot-ap + pop-hotspot-ap.service"
+    echo "    the app toggles it with no password (polkit rule scoped to that unit)"
+    echo "    want it on at boot?  sudo systemctl enable pop-hotspot-ap"
+fi
+
 say "Done."
 echo "    Pop Hotspot  : launch from your app menu, or run: pop-hotspot"
 echo "    USB tether   : toggle it inside Pop Hotspot (needs the USB cable + USB debugging)"

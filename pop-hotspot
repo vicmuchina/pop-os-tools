@@ -77,6 +77,8 @@ def ghz5_status():
                             "(no initiate radiation), so no access point can start there.")
 
 def is_hotspot_active():
+    if hostapd_service_active():
+        return True
     r = run_cmd(["nmcli", "-t", "-f", "NAME,STATE", "connection", "show"])
     if r and r.returncode == 0:
         for line in r.stdout.splitlines():
@@ -84,6 +86,57 @@ def is_hotspot_active():
             if len(parts) >= 2 and parts[0] == CONN_NAME:
                 return parts[1] == "activated"
     return False
+
+# ---------------------------------------------------------------------------
+# AP backends
+#   hostapd       — real AP daemon; the only one picky clients (TVs) accept.
+#                   Runs as the system service pop-hotspot-ap (root, started
+#                   without a password via a polkit rule scoped to that unit).
+#   networkmanager— NM's AP mode (wpa_supplicant). Fine for phones/laptops,
+#                   refused by many TVs. Kept as a fallback.
+# ---------------------------------------------------------------------------
+HOSTAPD_SERVICE = "pop-hotspot-ap"
+HOSTAPD_CONF = os.path.expanduser("~/.local/share/pop-hotspot/hostapd.conf")
+
+def hostapd_backend_available():
+    r = run_cmd(["systemctl", "list-unit-files", f"{HOSTAPD_SERVICE}.service"], timeout=8)
+    return bool(r and r.returncode == 0 and HOSTAPD_SERVICE in (r.stdout or ""))
+
+def hostapd_service_active():
+    r = run_cmd(["systemctl", "is-active", HOSTAPD_SERVICE], timeout=8)
+    return bool(r and (r.stdout or "").strip() == "active")
+
+def write_hostapd_conf():
+    """Render hostapd.conf from the app's settings so Save && Recreate applies."""
+    band = str(config.get("band", "auto"))
+    chan = str(config.get("channel") or "auto").strip()
+    if band == "a" and chan.isdigit() and int(chan) > 14:
+        hw_mode, channel = "a", chan
+    else:
+        hw_mode, channel = "g", chan if chan.isdigit() and 1 <= int(chan) <= 13 else "6"
+    conf = (
+        f"interface={WIFI_IFACE}\n"
+        "driver=nl80211\n"
+        f"ssid={config['ssid']}\n"
+        f"hw_mode={hw_mode}\n"
+        f"channel={channel}\n"
+        "ieee80211n=1\n"
+        "wmm_enabled=1\n"
+        "auth_algs=1\n"
+        "wpa=2\n"
+        f"wpa_passphrase={config['password']}\n"
+        "wpa_key_mgmt=WPA-PSK\n"
+        "rsn_pairwise=CCMP\n"
+        "country_code=KE\n"
+        "logger_syslog=-1\n"
+        "logger_syslog_level=1\n"
+        "ctrl_interface=/run/hostapd\n"
+        "ctrl_interface_group=0\n"
+    )
+    os.makedirs(os.path.dirname(HOSTAPD_CONF), exist_ok=True)
+    with open(HOSTAPD_CONF, "w") as f:
+        f.write(conf)
+    return True
 
 def conn_exists():
     r = run_cmd(["nmcli", "-t", "-f", "NAME", "connection", "show"])
@@ -258,6 +311,19 @@ def tether_stop():
     return True
 
 def turn_on_hotspot():
+    global last_error
+    # ── preferred backend: hostapd (TV-compatible) ──────────────────────────
+    backend = config.get("backend", "hostapd")
+    if backend == "hostapd" and hostapd_backend_available():
+        write_hostapd_conf()
+        r = run_cmd(["systemctl", "start", HOSTAPD_SERVICE], timeout=60)
+        if r and r.returncode == 0 and hostapd_service_active():
+            last_error = ""
+            return True
+        last_error = (r.stderr or "").strip().splitlines()[-1] if r and (r.stderr or "").strip() \
+                     else "hostapd backend failed to start"
+        # fall through to NetworkManager rather than leaving the user without a hotspot
+
     ensure_iface_up()
     if conn_exists():
         run_cmd(["nmcli", "connection", "delete", CONN_NAME])
@@ -296,7 +362,6 @@ def turn_on_hotspot():
         reset_wifi_iface()
         up = run_cmd(["nmcli", "connection", "up", CONN_NAME], timeout=45)
     ok = bool(up and up.returncode == 0)
-    global last_error
     if ok:
         last_error = ""
     else:
@@ -312,6 +377,10 @@ def turn_on_hotspot():
     return ok
 
 def turn_off_hotspot():
+    if hostapd_service_active():
+        r = run_cmd(["systemctl", "stop", HOSTAPD_SERVICE], timeout=60)
+        clear_iptables_block()
+        return bool(r and r.returncode == 0)
     r = run_cmd(["nmcli", "connection", "down", CONN_NAME])
     clear_iptables_block()
     return r and r.returncode == 0
@@ -474,6 +543,16 @@ class HotspotApp(Gtk.Window):
             label="Keep USB tether running after closing this window")
         self.persist_check.set_active(bool(config.get("tether_persist", False)))
         settings_box.pack_start(self.persist_check, False, False, 0)
+
+        row_be = Gtk.Box(spacing=8)
+        row_be.pack_start(Gtk.Label(label="AP backend:", width_chars=12), False, False, 0)
+        self.backend_combo = Gtk.ComboBoxText()
+        hpd_ok = hostapd_backend_available()
+        self.backend_combo.append("hostapd", "hostapd — TV compatible" + ("" if hpd_ok else " (not installed)"))
+        self.backend_combo.append("networkmanager", "NetworkManager — phones/laptops")
+        self.backend_combo.set_active_id(config.get("backend", "hostapd"))
+        row_be.pack_start(self.backend_combo, True, True, 0)
+        settings_box.pack_start(row_be, False, False, 0)
 
         hb = Gtk.Box(spacing=8)
         show_btn = Gtk.Button(label="Show")
@@ -745,6 +824,7 @@ class HotspotApp(Gtk.Window):
         config["password"] = new_pass
         config["band"] = self.band_combo.get_active_id() or "auto"
         config["channel"] = self.chan_combo.get_active_id() or "auto"
+        config["backend"] = self.backend_combo.get_active_id() or "hostapd"
         config["tether_persist"] = bool(self.persist_check.get_active())
         save_json(CONFIG_FILE, config)
         if was_active:

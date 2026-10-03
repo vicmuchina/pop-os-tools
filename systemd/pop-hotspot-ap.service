@@ -1,0 +1,17 @@
+[Unit]
+Description=Pop Hotspot AP (hostapd + dnsmasq + NAT) — TV-compatible hotspot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=POP_HOTSPOT_HOME=@HOME@
+Environment=POP_HOTSPOT_RUN_DIR=/run/pop-hotspot
+ExecStart=/usr/local/sbin/pop-hotspot-ap start
+ExecStop=/usr/local/sbin/pop-hotspot-ap stop
+Restart=no
+
+# Optional: uncomment to have the hotspot come up at boot.
+# [Install]
+# WantedBy=multi-user.target
